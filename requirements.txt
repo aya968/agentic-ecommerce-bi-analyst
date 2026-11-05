@@ -1,0 +1,9 @@
+langchain
+langgraph
+langchain-groq
+fastapi
+uvicorn
+streamlit
+pandas
+plotly
+pydantic
