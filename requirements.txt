@@ -1,9 +1,8 @@
-langchain
-langgraph
-langchain-groq
+requests
+pandas
 fastapi
 uvicorn
 streamlit
-pandas
-plotly
-pydantic
+langgraph
+python-dotenv
+openpyxl
