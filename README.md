@@ -2,11 +2,11 @@
 # E-commerce AI Analyst
 ### AI-Powered Business Intelligence, Demand Forecasting & Inventory Optimization
 
-An intelligent E-commerce analytics platform that transforms raw sales data into actionable business insights using a locally hosted Large Language Model (LLM).
+An intelligent E-commerce analytics platform that transforms raw sales data into actionable business insights using Google's Gemini API.
 
 The platform allows users to upload E-commerce datasets, explore business performance, ask questions in natural language, generate SQL queries automatically, forecast product demand, and receive inventory replenishment recommendations.
 
-Built with Python, Streamlit, FastAPI, LangGraph, SQLite, and Ollama.
+Built with Python, Streamlit, FastAPI, LangGraph, SQLite, and the Google Gen AI Python SDK.
 
 ---
 
@@ -172,7 +172,7 @@ The application does not invent stock quantities or supplier lead times.
      LANGGRAPH         DEMAND FORECAST
           |                  |
           v                  v
-     OLLAMA LLM        INVENTORY ENGINE
+     GEMINI API        INVENTORY ENGINE
           |                  |
           v                  v
      SQL VALIDATION    REORDER SUGGESTIONS
@@ -199,21 +199,25 @@ The application does not invent stock quantities or supplier lead times.
 | Streamlit | Interactive dashboard |
 | FastAPI | Backend REST API |
 | LangGraph | AI Agent workflow orchestration |
-| Ollama | Local LLM runtime |
-| Qwen 2.5 Coder 3B | Local language model |
-| Requests | Communication with Ollama |
+| Google Gen AI SDK | Gemini API client |
+| Gemini 3.5 Flash-Lite | Default language model |
 | OpenPyXL | Excel file support |
 | Python-dotenv | Environment configuration |
 
-### Local AI Architecture
+### Gemini API
 
-The application uses:
+The application sends prompts to Google's Gemini API using:
 
-- Runtime: Ollama
-- Model: qwen2.5-coder:3b
-- Default endpoint: http://127.0.0.1:11434
+- SDK: `google-genai`
+- Default model: `gemini-3.5-flash-lite` (configurable with `GEMINI_MODEL`)
+- API key: `GEMINI_API_KEY`, read by the backend from `.env`
 
-No external Gemini or OpenAI API key is required.
+Gemini inference requires internet access. Dataset schema, the user's question,
+and SQL query results used to create insights are sent to Google for inference;
+avoid submitting confidential or regulated data unless permitted by your
+organization's data-handling policies. Gemini API quotas and pricing depend on
+your account, model, and usage. Review Google's current [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing)
+and quotas before use.
 
 ---
 
@@ -252,7 +256,7 @@ ecommerce_ai_analyst/
 ├── api.py
 ├── streamlit_app.py
 ├── requirements.txt
-├── .env
+├── .env.example
 └── README.md
 ```
 
@@ -263,7 +267,7 @@ ecommerce_ai_analyst/
 ### Prerequisites
 
 - Python 3.10 or newer.
-- Ollama installed.
+- A Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey).
 - Git (optional).
 
 ### 1. Clone the Repository
@@ -295,33 +299,34 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Download the Local LLM
+### 4. Configure Gemini
 
-```bash
-ollama pull qwen2.5-coder:3b
+Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey).
+Copy `.env.example` to `.env` in the project root, then set `GEMINI_API_KEY` to
+your new key. Keep `.env` private; it is excluded from Git.
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
-### 5. Configure Environment Variables
+Linux / macOS:
 
-Create a `.env` file in the project root:
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and replace the placeholder:
 
 ```env
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen2.5-coder:3b
-DB_PATH=data/ecommerce.db
+GEMINI_API_KEY=your_new_key_here
 ```
 
-### 6. Start Ollama
+Optional configuration includes the Gemini model, request timeout, retry count,
+retry delay, and database path; the defaults are listed in `.env.example`.
 
-```bash
-ollama serve
-```
-
-If Ollama is already running as a background service, this step is not necessary.
-
-### 7. Launch the Streamlit Dashboard
-
-Open another terminal:
+### 5. Launch the Streamlit Dashboard
 
 ```bash
 streamlit run streamlit_app.py
@@ -330,6 +335,8 @@ streamlit run streamlit_app.py
 The dashboard will normally be available at:
 
 http://localhost:8501
+
+Internet access is required for Gemini inference. No local LLM runtime is needed.
 
 ---
 
@@ -494,12 +501,15 @@ These should be considered before using recommendations for actual purchasing de
 
 ## Security & Data Handling
 
-- The LLM runs locally through Ollama.
+- Gemini API keys are loaded by the backend from `.env`; do not put them in
+  frontend code, API responses, logs, or source control.
+- Prompts and query results are sent to Google's Gemini API for inference.
 - SQL queries are restricted to SELECT statements.
 - SQLite is opened in read-only mode for AI-generated queries.
 - A SQLite authorizer provides an additional query execution restriction.
 - Uploaded datasets are stored in the local SQLite database.
-- No external LLM API key is required.
+- Internet access and a valid Gemini API key are required for LLM features.
+- API quotas, rate limits, and possible usage costs are controlled by Google.
 
 The current implementation is intended for local development and demonstration. Additional authentication, authorization, upload limits, isolation, and security testing are required before public deployment.
 
@@ -571,4 +581,4 @@ Add your preferred open-source license before public distribution.
 
 Developed as an E-commerce AI Analytics project.
 
-**Technologies:** Python | Streamlit | FastAPI | LangGraph | Ollama | SQLite
+**Technologies:** Python | Streamlit | FastAPI | LangGraph | Gemini API | SQLite

@@ -1,12 +1,18 @@
-import requests
 import json
+import time
 
+import httpx
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from langgraph.graph import StateGraph, END
 
 from app.config import (
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
-    OLLAMA_TIMEOUT
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GEMINI_TIMEOUT_SECONDS,
+    GEMINI_MAX_RETRIES,
+    GEMINI_RETRY_DELAY_SECONDS
 )
 
 from app.agents.state import AgentState
@@ -18,45 +24,90 @@ from app.agents.prompts import (
 from app.agents.sql_validator import SQLValidator
 
 
-def query_local_llm(prompt, system_prompt="", temperature=0.1):
-    url = f"{OLLAMA_BASE_URL}/api/generate"
+def query_llm(prompt, system_prompt="", temperature=0.1):
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Gemini API key is not configured. "
+            "Set GEMINI_API_KEY in your .env file."
+        )
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "system": system_prompt,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature
-        }
-    }
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            timeout=GEMINI_TIMEOUT_SECONDS * 1000
+        )
+    )
 
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=OLLAMA_TIMEOUT
-        )
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt or None,
+                        temperature=temperature
+                    )
+                )
+                break
 
-        response.raise_for_status()
+            except genai_errors.APIError as error:
+                status_code = error.code
+                retryable = (
+                    status_code == 429
+                    or status_code in {500, 502, 503, 504}
+                )
+                if retryable and attempt < GEMINI_MAX_RETRIES:
+                    time.sleep(GEMINI_RETRY_DELAY_SECONDS * (2 ** attempt))
+                    continue
 
-        return response.json().get("response", "").strip()
+                if status_code in {401, 403}:
+                    message = (
+                        "Gemini access was denied. Check the API key, "
+                        "API access, and configured model."
+                    )
+                elif status_code == 429:
+                    message = (
+                        "Gemini rate limit exceeded. Wait a moment and retry."
+                    )
+                elif status_code in {408, 504}:
+                    message = "Gemini request timed out. Please try again."
+                elif status_code >= 500:
+                    message = (
+                        "Gemini is temporarily unavailable. Please try again."
+                    )
+                else:
+                    message = (
+                        "Gemini request failed. Check your API configuration "
+                        "and try again."
+                    )
+                raise RuntimeError(message) from None
 
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            "Cannot connect to Ollama. "
-            "Run: ollama run qwen2.5-coder:3b"
-        )
+            except httpx.TimeoutException:
+                if attempt < GEMINI_MAX_RETRIES:
+                    time.sleep(GEMINI_RETRY_DELAY_SECONDS * (2 ** attempt))
+                    continue
+                raise RuntimeError(
+                    "Gemini request timed out. Please try again."
+                ) from None
 
-    except requests.exceptions.Timeout:
-        raise RuntimeError(
-            "Ollama request timed out."
-        )
+            except httpx.TransportError:
+                if attempt < GEMINI_MAX_RETRIES:
+                    time.sleep(GEMINI_RETRY_DELAY_SECONDS * (2 ** attempt))
+                    continue
+                raise RuntimeError(
+                    "Could not connect to Gemini. Check your internet "
+                    "connection and try again."
+                ) from None
 
-    except requests.exceptions.RequestException as error:
-        raise RuntimeError(
-            f"Ollama request failed: {error}"
-        )
+        text = response.text
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError(
+                "Gemini returned an empty or non-text response. Please retry."
+            )
+        return text.strip()
+    finally:
+        client.close()
 
 
 def generate_sql_node(state: AgentState):
@@ -75,7 +126,7 @@ Return SQL only.
 """
 
     try:
-        generated_sql = query_local_llm(
+        generated_sql = query_llm(
             prompt,
             SQL_SYSTEM_PROMPT
         )
@@ -144,7 +195,7 @@ Explain the result as an E-commerce business analyst.
 """
 
     try:
-        insight = query_local_llm(
+        insight = query_llm(
             prompt,
             INSIGHT_SYSTEM_PROMPT,
             temperature=0.3
@@ -201,6 +252,7 @@ def build_agent():
     return workflow.compile()
 
 
+# Build the agent once at module load time to avoid repeated compilation
 agent = build_agent()
 
 

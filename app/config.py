@@ -10,16 +10,13 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "ecommerce.db"))
 
-OLLAMA_BASE_URL = os.getenv(
-    "OLLAMA_BASE_URL",
-    "http://127.0.0.1:11434"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60"))
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
+GEMINI_RETRY_DELAY_SECONDS = float(
+    os.getenv("GEMINI_RETRY_DELAY_SECONDS", "1")
 )
 
-OLLAMA_MODEL = os.getenv(
-    "OLLAMA_MODEL",
-    "qwen2.5-coder:3b"
-)
-
-OLLAMA_TIMEOUT = 180
 MAX_ROWS_PREVIEW = 10
 MAX_SQL_ROWS = 500
