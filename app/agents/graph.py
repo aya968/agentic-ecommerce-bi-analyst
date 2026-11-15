@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 import time
 
@@ -23,10 +24,85 @@ from app.agents.prompts import (
 )
 
 from app.agents.sql_validator import SQLValidator
+from app.agents.query_planner import (
+    PLAN_SYSTEM_PROMPT,
+    build_schema_context,
+    check_plan_support,
+    parse_query_plan,
+    query_plan_prompt,
+    semantic_role_label
+)
 
 
 MAX_SQL_RETRIES = 2
 MAX_SQL_ERROR_CONTEXT_LENGTH = 500
+logger = logging.getLogger(__name__)
+
+
+def plan_query_node(state: AgentState):
+    try:
+        response = query_llm(
+            query_plan_prompt(
+                state.get("question", ""),
+                state["schema_context"]
+            ),
+            PLAN_SYSTEM_PROMPT,
+            temperature=0.0
+        )
+        plan = check_plan_support(
+            parse_query_plan(response),
+            state["schema_context"]
+        )
+    except Exception as error:
+        logger.warning(
+            "Query planning failed (%s).",
+            type(error).__name__
+        )
+        return {
+            "plan_ready": False,
+            "error": (
+                "The question could not be planned against the active "
+                "dataset schema. Please rephrase it and try again."
+            ),
+            "success": False
+        }
+
+    if not plan["supported"]:
+        if plan["ambiguous_concepts"]:
+            labels = ", ".join(
+                semantic_role_label(role)
+                for role in plan["ambiguous_concepts"]
+            )
+            reason = (
+                f"Confirm the ambiguous dataset mapping(s): {labels}."
+            )
+        elif plan["missing_concepts"]:
+            labels = ", ".join(
+                semantic_role_label(role)
+                for role in plan["missing_concepts"]
+            )
+            reason = (
+                f"The active dataset is missing required information: "
+                f"{labels}."
+            )
+        else:
+            reason = (
+                plan.get("unsupported_reason")
+                or "The requested analysis is not supported by this dataset."
+            )
+            reason = str(reason)[:300]
+        return {
+            "query_plan": plan,
+            "plan_ready": False,
+            "error": reason,
+            "success": False
+        }
+
+    return {
+        "query_plan": plan,
+        "plan_ready": True,
+        "error": None
+    }
 
 
 def query_llm(prompt, system_prompt="", temperature=0.1):
@@ -117,6 +193,11 @@ def query_llm(prompt, system_prompt="", temperature=0.1):
 
 def generate_sql_node(state: AgentState):
     schema = state.get("schema_description", "")
+    query_plan = json.dumps(
+        state.get("query_plan", {}),
+        ensure_ascii=False,
+        indent=2
+    )
     correction_context = ""
     previous_sql = state.get("previous_sql")
     sql_error = state.get("sql_error")
@@ -140,6 +221,10 @@ Database schema:
 
 {schema}
 
+Structured analytical plan:
+
+{query_plan}
+
 User question:
 {state.get("question", "")}
 
@@ -155,11 +240,11 @@ Return SQL only.
             SQL_SYSTEM_PROMPT
         )
 
-        if generated_sql.strip() == "CANNOT_ANSWER":
+        if generated_sql.strip().upper() == "CANNOT_ANSWER":
             return {
                 "error": (
-                    "The available dataset does not contain "
-                    "the columns needed to answer this question."
+                    "The query generator could not express the supported "
+                    "analysis as SQL. No query was executed."
                 ),
                 "success": False,
                 "sql_ready": False,
@@ -188,6 +273,10 @@ Return SQL only.
 
 def route_after_generation(state: AgentState):
     return "execute_sql" if state.get("sql_ready") else END
+
+
+def route_after_planning(state: AgentState):
+    return "generate_sql" if state.get("plan_ready") else END
 
 
 def _sql_error_context(error):
@@ -284,11 +373,21 @@ def route_after_execution(state: AgentState):
 def build_agent():
     workflow = StateGraph(AgentState)
 
+    workflow.add_node("plan_query", plan_query_node)
     workflow.add_node("generate_sql", generate_sql_node)
     workflow.add_node("execute_sql", execute_sql_node)
     workflow.add_node("generate_insight", generate_insight_node)
 
-    workflow.set_entry_point("generate_sql")
+    workflow.set_entry_point("plan_query")
+
+    workflow.add_conditional_edges(
+        "plan_query",
+        route_after_planning,
+        {
+            "generate_sql": "generate_sql",
+            END: END
+        }
+    )
 
     workflow.add_conditional_edges(
         "generate_sql",
@@ -319,15 +418,22 @@ agent = build_agent()
 
 
 def ask_agent(question, schema_profile, db_path=None):
+    active_schema = dict(schema_profile)
+    if db_path is not None:
+        active_schema["database_schema"] = (
+            SQLValidator.get_database_schema(db_path)
+        )
+    schema_context = build_schema_context(active_schema)
     schema_description = json.dumps(
-        schema_profile,
+        schema_context,
         ensure_ascii=False,
         indent=2
     )
 
     initial_state = {
         "question": question,
-        "schema_profile": schema_profile,
+        "schema_profile": active_schema,
+        "schema_context": schema_context,
         "schema_description": schema_description,
         "retry_count": 0,
         "success": False,

@@ -17,6 +17,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from app.agents.graph import ask_agent
+from app.agents.sql_validator import SQLValidator
 from app.analytics.forecasting import DemandForecaster
 from app.analytics.inventory import InventoryOptimizer
 from app.config import DATA_DIR, MAX_UPLOAD_BYTES, SESSION_TTL_SECONDS
@@ -248,6 +249,9 @@ async def upload_data(
                         table_name="ecommerce_data",
                         report=report
                     )
+                    schema["database_schema"] = (
+                        SQLValidator.get_database_schema(staged_database)
+                    )
                     if had_previous_database:
                         shutil.copy2(database_path, backup_database)
                     os.replace(
@@ -333,6 +337,11 @@ def update_schema_mapping(
                 request.overrides,
                 original_column_names=session["schema"].get(
                     "original_columns"
+                )
+            )
+            schema["database_schema"] = (
+                SQLValidator.get_database_schema(
+                    session["database_path"]
                 )
             )
             session_store.update_session(session_id, schema=schema)

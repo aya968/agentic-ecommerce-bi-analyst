@@ -703,9 +703,7 @@ with st.container(border=True):
         """
     )
 
-    st.caption(
-        "Cloud AI powered by Google's Gemini API"
-    )
+
 
 
 # =========================================================

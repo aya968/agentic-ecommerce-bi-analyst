@@ -21,6 +21,19 @@ SQL_RESULT = {
     "row_count": 1,
     "truncated": False
 }
+PLAN_RESPONSE = """
+{
+  "intent": "sum revenue",
+  "entities": ["sales"],
+  "metrics": ["revenue"],
+  "dimensions": [],
+  "filters": [],
+  "time_granularity": null,
+  "required_concepts": ["revenue"],
+  "supported": true,
+  "unsupported_reason": null
+}
+"""
 
 
 class LangGraphRetryTests(unittest.TestCase):
@@ -28,6 +41,7 @@ class LangGraphRetryTests(unittest.TestCase):
         with patch(
             "app.agents.graph.query_llm",
             side_effect=[
+                PLAN_RESPONSE,
                 "SELECT SUM(revenue) AS total_revenue FROM ecommerce_data",
                 "Revenue totaled 15."
             ]
@@ -44,7 +58,7 @@ class LangGraphRetryTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["data"], SQL_RESULT["rows"])
         self.assertEqual(result["insight"], "Revenue totaled 15.")
-        self.assertEqual(query.call_count, 2)
+        self.assertEqual(query.call_count, 3)
         execute.assert_called_once()
 
     def test_execution_error_is_passed_to_corrective_prompt(self):
@@ -53,7 +67,12 @@ class LangGraphRetryTests(unittest.TestCase):
 
         with patch(
             "app.agents.graph.query_llm",
-            side_effect=[failed_sql, corrected_sql, "Corrected insight."]
+            side_effect=[
+                PLAN_RESPONSE,
+                failed_sql,
+                corrected_sql,
+                "Corrected insight."
+            ]
         ) as query:
             with patch(
                 "app.agents.graph.SQLValidator.execute_read_only",
@@ -69,9 +88,9 @@ class LangGraphRetryTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["sql"], corrected_sql)
-        self.assertEqual(query.call_count, 3)
+        self.assertEqual(query.call_count, 4)
         self.assertEqual(execute.call_count, 2)
-        correction_prompt = query.call_args_list[1].args[0]
+        correction_prompt = query.call_args_list[2].args[0]
         self.assertIn(failed_sql, correction_prompt)
         self.assertIn("no such column: total", correction_prompt)
         self.assertIn("correction attempt 1 of", correction_prompt)
@@ -80,6 +99,7 @@ class LangGraphRetryTests(unittest.TestCase):
         with patch(
             "app.agents.graph.query_llm",
             side_effect=[
+                PLAN_RESPONSE,
                 "SELECT missing FROM ecommerce_data",
                 "SELECT still_missing FROM ecommerce_data",
                 "SELECT also_missing FROM ecommerce_data"
@@ -97,7 +117,7 @@ class LangGraphRetryTests(unittest.TestCase):
                 )
 
         self.assertFalse(result["success"])
-        self.assertEqual(query.call_count, MAX_SQL_RETRIES + 1)
+        self.assertEqual(query.call_count, MAX_SQL_RETRIES + 2)
         self.assertEqual(execute.call_count, MAX_SQL_RETRIES + 1)
         self.assertIn("2 correction attempts", result["error"])
         self.assertNotIn("no such column", result["error"])

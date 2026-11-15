@@ -5,6 +5,9 @@ class AgentState(TypedDict, total=False):
     question: str
     schema_profile: dict
     schema_description: str
+    schema_context: dict
+    query_plan: dict
+    plan_ready: bool
     generated_sql: str
     sql_result: list
     columns: list

@@ -141,6 +141,12 @@ class LangGraphIntegrationTests(unittest.TestCase):
             with patch(
                 "app.agents.graph.query_llm",
                 side_effect=[
+                    (
+                        '{"intent":"sum revenue","entities":["sales"],'
+                        '"metrics":["revenue"],"dimensions":[],"filters":[],'
+                        '"time_granularity":null,"required_concepts":'
+                        '["revenue"],"supported":true,"unsupported_reason":null}'
+                    ),
                     "SELECT product, revenue FROM ecommerce_data",
                     "Widget generated 42.5 in revenue."
                 ]
@@ -151,7 +157,11 @@ class LangGraphIntegrationTests(unittest.TestCase):
                 ):
                     result = ask_agent(
                         "What is the revenue?",
-                        {"table": "ecommerce_data"}
+                        {
+                            "table": "ecommerce_data",
+                            "product": "product",
+                            "revenue": "revenue"
+                        }
                     )
 
             self.assertTrue(result["success"])
@@ -160,7 +170,7 @@ class LangGraphIntegrationTests(unittest.TestCase):
                 [{"product": "Widget", "revenue": 42.5}]
             )
             self.assertEqual(result["insight"], "Widget generated 42.5 in revenue.")
-            self.assertEqual(query.call_count, 2)
+            self.assertEqual(query.call_count, 3)
 
             with self.assertRaisesRegex(ValueError, "Only SELECT"):
                 SQLValidator.execute_read_only(
