@@ -1,4 +1,3 @@
-import os
 import shutil
 import uuid
 
@@ -12,7 +11,7 @@ from app.utils.schema_analyzer import SchemaAnalyzer
 from app.agents.graph import ask_agent
 from app.analytics.forecasting import DemandForecaster
 from app.analytics.inventory import InventoryOptimizer
-from app.config import DATA_DIR
+from app.config import UPLOAD_DIR
 
 
 app = FastAPI(
@@ -25,6 +24,7 @@ schema_analyzer = SchemaAnalyzer()
 forecaster = DemandForecaster()
 inventory_optimizer = InventoryOptimizer()
 
+# The API uses one process-wide active dataset and is intended for one user.
 current_schema = None
 
 
@@ -39,6 +39,28 @@ class InventoryRequest(BaseModel):
     )
 
 
+class SchemaMappingRequest(BaseModel):
+    overrides: dict[str, str | None]
+
+
+def public_schema_profile(profile):
+    """Avoid returning sampled uploaded values in API responses."""
+    public_profile = {
+        key: value
+        for key, value in profile.items()
+        if key not in {"all_columns", "column_profiles"}
+    }
+    public_profile["column_profiles"] = [
+        {
+            key: value
+            for key, value in column_profile.items()
+            if key != "sample_values"
+        }
+        for column_profile in profile.get("column_profiles", [])
+    ]
+    return public_profile
+
+
 @app.get("/")
 def home():
     return {
@@ -50,50 +72,100 @@ def home():
 async def upload_data(file: UploadFile = File(...)):
     global current_schema
 
-    extension = Path(file.filename).suffix.lower()
-
-    if extension not in [".csv", ".xlsx", ".xls"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Only CSV and Excel files are supported."
-        )
-
-    unique_name = f"{uuid.uuid4().hex}{extension}"
-    file_path = DATA_DIR / unique_name
-
+    file_path = None
+    upload_succeeded = False
     try:
+        extension = Path(file.filename or "").suffix.lower()
+        if extension not in [".csv", ".xlsx", ".xls"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Only CSV and Excel files are supported."
+            )
+
+        file_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{extension}"
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        report = db_manager.load_file_to_sqlite(
+        dataframe, report = db_manager.prepare_file(
             str(file_path),
-            table_name="ecommerce_data"
         )
-
-        df = db_manager.get_dataframe()
-
-        current_schema = schema_analyzer.analyze(df)
+        original_column_names = [
+            mapping["original"]
+            for mapping in report["column_name_mapping"]
+        ]
+        new_schema = schema_analyzer.analyze(
+            dataframe,
+            original_column_names=original_column_names
+        )
+        report = db_manager.save_dataframe_to_sqlite(
+            dataframe,
+            table_name="ecommerce_data",
+            report=report
+        )
+        current_schema = new_schema
+        upload_succeeded = True
 
         return {
             "success": True,
             "message": "Dataset uploaded successfully.",
             "cleaning_report": report,
-            "schema_profile": {
-                key: value
-                for key, value in current_schema.items()
-                if key != "all_columns"
-            },
-            "columns": list(df.columns)
+            "schema_profile": public_schema_profile(new_schema),
+            "columns": list(dataframe.columns)
         }
 
-    except Exception as error:
+    except HTTPException:
+        raise
+    except ValueError as error:
         raise HTTPException(
             status_code=400,
             detail=str(error)
-        )
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Dataset upload failed. The previously active dataset "
+                "was preserved."
+            )
+        ) from error
 
     finally:
+        if file_path is not None and not upload_succeeded:
+            try:
+                file_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         await file.close()
+
+
+@app.post("/schema-mapping")
+def update_schema_mapping(request: SchemaMappingRequest):
+    global current_schema
+
+    if current_schema is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a dataset first."
+        )
+
+    try:
+        dataframe = db_manager.get_dataframe()
+        current_schema = schema_analyzer.apply_overrides(
+            dataframe,
+            request.overrides,
+            original_column_names=current_schema.get("original_columns")
+        )
+        return public_schema_profile(current_schema)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Schema mappings could not be updated."
+        ) from error
 
 
 @app.post("/ask-agent")
@@ -115,8 +187,8 @@ def ask_question(request: QueryRequest):
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=str(error)
-        )
+            detail="The agent could not complete the request."
+        ) from error
 
 
 @app.get("/forecast-readiness")

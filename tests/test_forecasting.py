@@ -6,6 +6,7 @@ import pandas as pd
 
 from app.analytics.forecasting import (
     DemandForecaster,
+    _forecast_metrics,
     _fit_model_forecast
 )
 from app.analytics.inventory import InventoryOptimizer
@@ -29,6 +30,8 @@ def sales_frame(quantities, product="SKU-1", start="2022-01-03"):
 class ForecastPreparationTests(unittest.TestCase):
     def test_invalid_dates_and_quantities_are_dropped(self):
         frame = sales_frame([2] * 12)
+        frame["date"] = frame["date"].astype(object)
+        frame["quantity"] = frame["quantity"].astype(object)
         frame.loc[len(frame)] = ["SKU-1", "not-a-date", 4]
         frame.loc[len(frame)] = ["SKU-1", "2022-04-04", "not-a-number"]
 
@@ -60,19 +63,27 @@ class ForecastPreparationTests(unittest.TestCase):
         )
 
         zero_readiness = zero_forecaster.check_readiness(frame, SCHEMA)
-        zero_weekly, _, missing_count = zero_forecaster._complete_weekly_series(
-            zero_readiness["data"],
-            "quantity"
+        zero_observations, _, missing_count = (
+            zero_forecaster._complete_weekly_series(
+                zero_readiness["data"],
+                "quantity"
+            )
+        )
+        zero_weekly = zero_forecaster._impute_weekly_series(
+            zero_observations
         )
         interpolate_readiness = interpolate_forecaster.check_readiness(
             frame,
             SCHEMA
         )
-        interpolated, _, _ = (
+        interpolate_observations, _, _ = (
             interpolate_forecaster._complete_weekly_series(
                 interpolate_readiness["data"],
                 "quantity"
             )
+        )
+        interpolated = interpolate_forecaster._impute_weekly_series(
+            interpolate_observations
         )
 
         self.assertEqual(missing_count, 1)
@@ -81,6 +92,39 @@ class ForecastPreparationTests(unittest.TestCase):
         self.assertEqual(
             zero_forecaster.forecast(frame, SCHEMA)["missing_week_policy"],
             "zero"
+        )
+
+    def test_validation_metrics_ignore_imputed_targets_and_future_values(self):
+        frame = sales_frame([1] * 8 + [100] * 8)
+        frame = frame.drop(index=range(8, 12)).reset_index(drop=True)
+        forecaster = DemandForecaster(missing_week_policy="interpolate")
+        readiness = forecaster.check_readiness(frame, SCHEMA)
+        observations, observed_mask, _ = forecaster._complete_weekly_series(
+            readiness["data"],
+            "quantity"
+        )
+        splits = forecaster._backtest_splits(len(observations))
+
+        result = forecaster._evaluate_candidate(
+            "moving_average",
+            observations,
+            observed_mask,
+            splits
+        )
+
+        self.assertEqual(result["status"], "evaluated")
+        self.assertEqual(result["folds"], 1)
+        self.assertEqual(result["validation_periods"], 4)
+        self.assertEqual(result["validation_mae"], 99)
+        self.assertEqual(result["validation_wape"], 0.99)
+
+    def test_zero_demand_wape_is_defined_only_for_zero_error(self):
+        self.assertEqual(
+            _forecast_metrics([0, 0], [0, 0])["validation_wape"],
+            0
+        )
+        self.assertIsNone(
+            _forecast_metrics([0, 0], [1, 0])["validation_wape"]
         )
 
     def test_invalid_schema_and_insufficient_history_are_reported(self):
@@ -185,6 +229,10 @@ class ModelSelectionTests(unittest.TestCase):
         diagnostic = self.diagnostics(result)
 
         self.assertTrue(diagnostic["fallback_used"])
+        self.assertEqual(
+            diagnostic["validation_status"],
+            "insufficient_validation_data"
+        )
         self.assertEqual(
             diagnostic["selected_model"],
             "8_week_moving_average"

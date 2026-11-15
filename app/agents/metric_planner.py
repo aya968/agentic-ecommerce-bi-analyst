@@ -7,6 +7,7 @@ class MetricPlanner:
         concepts = profile.get(
             "business_concepts", {}
         )
+        derived_metrics = profile.get("derived_metrics", {})
 
         capabilities = profile.get(
             "metric_capabilities", {}
@@ -59,6 +60,11 @@ class MetricPlanner:
                 ]
                 if concept in available
             ]
+            if (
+                derived_metrics.get("revenue", {}).get("available")
+                and "derived_revenue" not in revenue_sources
+            ):
+                revenue_sources.append("derived_revenue")
 
             if "order_id" not in available:
 
@@ -110,6 +116,14 @@ class MetricPlanner:
                 return finish(
                     ["revenue"],
                     "Aggregate revenue using the verified revenue column."
+                )
+
+            derived_revenue = derived_metrics.get("revenue", {})
+            if derived_revenue.get("available"):
+                return finish(
+                    ["quantity", "unit_price"],
+                    "SUM(quantity * unit_price), using the documented derived "
+                    "revenue expression."
                 )
 
             if "line_total" in available:

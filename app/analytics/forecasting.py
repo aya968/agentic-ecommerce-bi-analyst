@@ -68,7 +68,7 @@ def _trend_reason(series):
 
     if (
         not math.isfinite(correlation)
-        or abs(slope) < scale * 0.05
+        or abs(slope) < scale * 0.01
         or abs(correlation) < 0.6
     ):
         return "A clear trend was not detected in the training weeks."
@@ -190,6 +190,12 @@ def _forecast_metrics(actual, predicted):
         abs(float(observed) - float(forecast))
         for observed, forecast in zip(actual, predicted)
     ]
+    if not errors:
+        return {
+            "validation_mae": None,
+            "validation_wape": None
+        }
+
     absolute_actual = sum(abs(float(value)) for value in actual)
     absolute_error = sum(errors)
 
@@ -370,15 +376,16 @@ class DemandForecaster:
         observed = observed.reindex(full_index)
         missing_weeks = int(observed.isna().sum())
 
-        if self.missing_week_policy == "zero":
-            weekly = observed.fillna(0.0)
-        else:
-            weekly = observed.interpolate(
-                method="linear",
-                limit_direction="both"
-            )
+        return observed.astype(float), observed.notna(), missing_weeks
 
-        return weekly.astype(float), observed.notna(), missing_weeks
+    def _impute_weekly_series(self, observed):
+        if self.missing_week_policy == "zero":
+            return observed.fillna(0.0).astype(float)
+
+        return observed.interpolate(
+            method="linear",
+            limit_direction="forward"
+        ).ffill().astype(float)
 
     def _backtest_splits(self, series_length):
         available_origins = (
@@ -413,9 +420,15 @@ class DemandForecaster:
 
         actual = []
         predicted = []
+        evaluated_folds = 0
 
         for train_end, validation_end in splits:
-            training = series.iloc[:train_end]
+            validation_mask = observed_mask.iloc[train_end:validation_end]
+            if not validation_mask.any():
+                continue
+
+            training_observations = series.iloc[:train_end]
+            training = self._impute_weekly_series(training_observations)
             observed_weeks = int(observed_mask.iloc[:train_end].sum())
             ineligible_reason = _eligibility_reason(
                 model,
@@ -472,17 +485,39 @@ class DemandForecaster:
                     )
                 }
 
+            validation = series.iloc[train_end:validation_end]
             actual.extend(
                 float(value)
-                for value in series.iloc[train_end:validation_end]
+                for value, is_observed in zip(validation, validation_mask)
+                if is_observed
             )
-            predicted.extend(forecast)
+            predicted.extend(
+                forecast[index]
+                for index, is_observed in enumerate(validation_mask)
+                if is_observed
+            )
+            evaluated_folds += 1
+
+        if not actual:
+            return {
+                "model": MODEL_LABELS[model],
+                "status": "insufficient_validation_data",
+                "folds": 0,
+                "validation_periods": 0,
+                "validation_mae": None,
+                "validation_wape": None,
+                "reason": (
+                    "No observed demand periods were available in the "
+                    "chronological validation windows."
+                )
+            }
 
         metrics = _forecast_metrics(actual, predicted)
         return {
             "model": MODEL_LABELS[model],
             "status": "evaluated",
-            "folds": len(splits),
+            "folds": evaluated_folds,
+            "validation_periods": len(actual),
             **metrics,
             "reason": None
         }
@@ -518,9 +553,23 @@ class DemandForecaster:
             if candidate["status"] == "evaluated"
         ]
         if not successful:
-            return "moving_average", candidates, (
+            reason = (
                 "No eligible model could be validated on a complete "
                 "chronological horizon; using the moving-average fallback."
+            )
+            if all(
+                candidate["status"] in {
+                    "not_evaluated",
+                    "insufficient_validation_data"
+                }
+                for candidate in candidates
+            ):
+                reason = (
+                    "Insufficient observed validation data for model "
+                    "selection; using the moving-average fallback."
+                )
+            return "moving_average", candidates, (
+                reason
             ), True
 
         has_defined_wape = any(
@@ -550,7 +599,7 @@ class DemandForecaster:
         return selected["model_id"], candidates, reason, False
 
     def _forecast_product(self, product, group, quantity_col):
-        weekly, observed_mask, missing_weeks = self._complete_weekly_series(
+        observed, observed_mask, missing_weeks = self._complete_weekly_series(
             group,
             quantity_col
         )
@@ -596,8 +645,9 @@ class DemandForecaster:
             return [], diagnostics
 
         selected_model, candidates, selection_reason, fallback_used = (
-            self._select_model(weekly, observed_mask)
+            self._select_model(observed, observed_mask)
         )
+        weekly = self._impute_weekly_series(observed)
         full_series_reason = _eligibility_reason(
             selected_model,
             weekly,
@@ -684,6 +734,14 @@ class DemandForecaster:
             "status": "forecasted",
             "selected_model": MODEL_LABELS[selected_model],
             "selection_reason": selection_reason,
+            "validation_status": (
+                "evaluated"
+                if any(
+                    candidate["status"] == "evaluated"
+                    for candidate in candidates
+                )
+                else "insufficient_validation_data"
+            ),
             "fallback_used": fallback_used,
             "validation_mae": validation_mae,
             "validation_wape": validation_wape,

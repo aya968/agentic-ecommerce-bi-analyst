@@ -1,14 +1,12 @@
-import os
-from pathlib import Path
-
+import httpx
 import pandas as pd
 import streamlit as st
 
 from app.database.db_manager import DatabaseManager
-from app.utils.schema_analyzer import SchemaAnalyzer
 from app.analytics.forecasting import DemandForecaster
 from app.analytics.inventory import InventoryOptimizer
-from app.agents.graph import ask_agent
+from app.config import API_BASE_URL, API_TIMEOUT_SECONDS
+from app.utils.schema_detection import ROLE_LABELS
 
 
 # =========================================================
@@ -198,12 +196,8 @@ footer {
 # =========================================================
 
 db_manager = DatabaseManager()
-schema_analyzer = SchemaAnalyzer()
 forecaster = DemandForecaster()
 inventory_optimizer = InventoryOptimizer()
-
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
 
 
 # =========================================================
@@ -231,6 +225,20 @@ def initialize_session():
 initialize_session()
 
 
+def clear_dataset_session():
+    for key in (
+        "uploaded",
+        "schema",
+        "cleaning_report",
+        "dataframe",
+        "forecast_result",
+        "dataset_name",
+        "inventory_result",
+        "dataset_uploader"
+    ):
+        st.session_state.pop(key, None)
+
+
 # =========================================================
 # HELPER FUNCTIONS
 # =========================================================
@@ -252,6 +260,97 @@ def format_number(value):
         return "—"
 
     return f"{value:,.2f}"
+
+
+def call_api(method, path, **kwargs):
+    try:
+        response = httpx.request(
+            method,
+            f"{API_BASE_URL}{path}",
+            timeout=API_TIMEOUT_SECONDS,
+            **kwargs
+        )
+    except httpx.TimeoutException as error:
+        raise RuntimeError(
+            "The backend API request timed out. Please try again."
+        ) from error
+    except httpx.RequestError as error:
+        raise RuntimeError(
+            "Could not reach the backend API. Check that the API service "
+            "is running and API_BASE_URL is configured correctly."
+        ) from error
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        message = (
+            detail
+            if isinstance(detail, str)
+            else "The backend API rejected the request."
+        )
+        raise RuntimeError(message) from error
+
+    try:
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError(
+            "The backend API returned an invalid response."
+        ) from error
+
+
+def schema_mapping_rows(schema):
+    profile_by_index = {
+        profile["column_index"]: profile
+        for profile in schema.get("column_profiles", [])
+    }
+    rows = []
+    for role, mapping in schema.get("field_mappings", {}).items():
+        candidates = mapping.get("candidates", [])
+        selected = next(
+            (
+                candidate for candidate in candidates
+                if candidate.get("column") == mapping.get("column")
+            ),
+            candidates[0] if candidates else None
+        )
+        column_profile = (
+            profile_by_index.get(selected["column_index"])
+            if selected
+            else None
+        )
+        rows.append({
+            "Semantic field": mapping.get(
+                "semantic_role",
+                ROLE_LABELS.get(role, role)
+            ),
+            "Original column": (
+                str(
+                    mapping.get("original_column")
+                    or mapping["column"]
+                )
+                if mapping.get("column") is not None
+                else "Not mapped"
+            ),
+            "Confidence": mapping.get("confidence"),
+            "Detection": mapping.get("detection_method"),
+            "Ambiguous": mapping.get("ambiguous", False),
+            "Candidates": ", ".join(
+                str(
+                    candidate.get("original_column")
+                    or candidate["column"]
+                )
+                for candidate in candidates
+            ),
+            "Sample values": ", ".join(
+                column_profile.get("sample_values", [])
+            ) if column_profile else "",
+            "Reason": mapping.get("reason")
+        })
+    return pd.DataFrame(rows)
 
 
 def show_missing_data(readiness):
@@ -345,6 +444,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Upload your dataset",
         type=["csv", "xlsx", "xls"],
+        key="dataset_uploader",
         help="Upload an E-commerce CSV or Excel file."
     )
 
@@ -359,48 +459,36 @@ with st.sidebar:
             type="primary",
             use_container_width=True
         ):
-
             try:
-
-                extension = Path(
-                    uploaded_file.name
-                ).suffix.lower()
-
-                temp_path = DATA_DIR / (
-                    "uploaded_ecommerce" + extension
-                )
-
-                with open(temp_path, "wb") as file:
-
-                    file.write(
-                        uploaded_file.getvalue()
-                    )
-
                 with st.spinner(
                     "Cleaning and analyzing your dataset..."
                 ):
-
-                    report = db_manager.load_file_to_sqlite(
-                        str(temp_path),
-                        table_name="ecommerce_data"
+                    result = call_api(
+                        "POST",
+                        "/upload-data",
+                        files={
+                            "file": (
+                                uploaded_file.name,
+                                uploaded_file.getvalue(),
+                                uploaded_file.type
+                                or "application/octet-stream"
+                            )
+                        }
                     )
-
-                    df = db_manager.get_dataframe()
-
-                    schema = schema_analyzer.analyze(df)
+                    dataframe = db_manager.get_dataframe()
+                    schema = result["schema_profile"]
+                    schema["all_columns"] = result.get(
+                        "columns",
+                        list(dataframe.columns)
+                    )
+                    report = result["cleaning_report"]
 
                     st.session_state.uploaded = True
-
-                    st.session_state.dataframe = df
-
+                    st.session_state.dataframe = dataframe
                     st.session_state.schema = schema
-
                     st.session_state.cleaning_report = report
-
                     st.session_state.dataset_name = uploaded_file.name
-
                     st.session_state.forecast_result = None
-
                     st.session_state.inventory_result = None
 
                 st.success(
@@ -423,29 +511,88 @@ with st.sidebar:
             st.session_state.dataset_name
         )
 
-        if st.button(
+        st.button(
             "Clear Session",
-            use_container_width=True
-        ):
+            use_container_width=True,
+            on_click=clear_dataset_session
+        )
 
-            for key in [
-                "uploaded",
-                "schema",
-                "cleaning_report",
-                "dataframe",
-                "forecast_result",
-                "dataset_name",
-                "inventory_result"
-            ]:
+        with st.expander("Review detected fields"):
+            active_df = st.session_state.dataframe
+            active_schema = st.session_state.schema
+            if active_df is not None and active_schema is not None:
+                options = [None] + list(active_df.columns)
+                source_names = active_schema.get(
+                    "original_columns",
+                    list(active_df.columns)
+                )
+                display_names = {
+                    column: (
+                        f"{source_names[index]} ({column})"
+                        if str(source_names[index]) != str(column)
+                        else str(column)
+                    )
+                    for index, column in enumerate(active_df.columns)
+                }
+                chosen_mappings = {}
+                with st.form("schema_mapping_form"):
+                    field_columns = st.columns(2)
+                    for index, (role, label) in enumerate(
+                        ROLE_LABELS.items()
+                    ):
+                        mapping = active_schema["field_mappings"][role]
+                        current = (
+                            None
+                            if mapping["ambiguous"]
+                            else mapping["column"]
+                        )
+                        default_index = (
+                            options.index(current)
+                            if current in options
+                            else 0
+                        )
+                        with field_columns[index % 2]:
+                            chosen_mappings[role] = st.selectbox(
+                                label,
+                                options,
+                                index=default_index,
+                                format_func=lambda value: (
+                                    "Not mapped"
+                                    if value is None
+                                    else display_names.get(
+                                        value,
+                                        str(value)
+                                    )
+                                ),
+                                key=f"schema_mapping_{role}"
+                            )
+                    submitted = st.form_submit_button(
+                        "Apply mappings",
+                        use_container_width=True
+                    )
 
-                st.session_state.pop(key, None)
-
-            st.rerun()
+                if submitted:
+                    try:
+                        updated_schema = call_api(
+                            "POST",
+                            "/schema-mapping",
+                            json={"overrides": chosen_mappings}
+                        )
+                        updated_schema["all_columns"] = list(
+                            active_df.columns
+                        )
+                        st.session_state.schema = updated_schema
+                        st.session_state.forecast_result = None
+                        st.session_state.inventory_result = None
+                        st.success("Schema mappings updated.")
+                        st.rerun()
+                    except RuntimeError as error:
+                        st.error(str(error))
 
     st.divider()
 
     st.caption(
-        "Powered by Python · Streamlit · LangGraph · Ollama"
+        "Powered by Python · Streamlit · LangGraph · Google Gemini"
     )
 
 
@@ -473,7 +620,7 @@ with st.container(border=True):
     )
 
     st.caption(
-        "Local AI powered by Ollama and Qwen 2.5 Coder"
+        "Cloud AI powered by Google's Gemini API"
     )
 
 
@@ -602,11 +749,31 @@ with st.expander("View Dataset Preview"):
 
 with st.expander("View Detected Schema"):
 
-    st.json({
-        key: value
-        for key, value in schema.items()
-        if key != "all_columns"
-    })
+    st.dataframe(
+        schema_mapping_rows(schema),
+        hide_index=True,
+        use_container_width=True
+    )
+    st.markdown("#### Analytical readiness")
+    for capability, readiness in schema.get("readiness", {}).items():
+        state = "Ready" if readiness["ready"] else "Needs data"
+        st.markdown(f"**{capability.replace('_', ' ').title()}: {state}**")
+        st.caption(readiness["explanation"])
+        if readiness["missing_fields"]:
+            st.write(
+                "Missing: " + ", ".join(readiness["missing_fields"])
+            )
+        for warning in readiness["warnings"]:
+            st.warning(warning)
+    if schema.get("derived_metrics"):
+        st.markdown("#### Derived metrics")
+        for metric, definition in schema["derived_metrics"].items():
+            if definition["available"] and definition["source"] == "derived":
+                st.write(
+                    f"- **{metric.title()}**: "
+                    f"`{definition['expression']}` — "
+                    f"{definition['calculation']}"
+                )
 
 
 # =========================================================
@@ -948,9 +1115,10 @@ with st.container(border=True):
 
                 try:
 
-                    result = ask_agent(
-                        question,
-                        schema
+                    result = call_api(
+                        "POST",
+                        "/ask-agent",
+                        json={"question": question}
                     )
 
                     if result.get("success"):
@@ -1292,7 +1460,7 @@ st.markdown(
     ">
         E-commerce AI Analyst<br>
         Intelligent Business Analytics Platform<br>
-        Powered by Python, Streamlit, LangGraph and Ollama
+        Powered by Python, Streamlit, LangGraph and Google Gemini
     </div>
     """,
     unsafe_allow_html=True

@@ -89,10 +89,11 @@ Forecast future product demand using historical sales data.
 Current implementation:
 - Product-level demand forecasting.
 - Weekly sales aggregation.
-- Missing weekly buckets are filled with zero.
-- Eight-week moving-average baseline.
+- 8-week moving-average, Holt linear, Croston SBA, and 52-week Holt-Winters models.
+- Per-product model selection using expanding-window backtesting.
 - Four-week forecast horizon.
-- Product-level data-readiness checks.
+- Configurable zero-fill or forward-only interpolation for missing weeks.
+- Product-level model diagnostics and validation metrics.
 
 The forecasting module does not generate predictions when essential data is unavailable.
 
@@ -201,7 +202,8 @@ The application does not invent stock quantities or supplier lead times.
 | LangGraph | AI Agent workflow orchestration |
 | Google Gen AI SDK | Gemini API client |
 | Gemini 3.5 Flash-Lite | Default language model |
-| OpenPyXL | Excel file support |
+| Statsmodels | Holt and Holt-Winters forecasting |
+| OpenPyXL / xlrd | `.xlsx` / legacy `.xls` files |
 | Python-dotenv | Environment configuration |
 
 ### Gemini API
@@ -249,9 +251,13 @@ ecommerce_ai_analyst/
 │   │
 │   └── utils/
 │       ├── __init__.py
-│       └── schema_analyzer.py
+│       ├── schema_analyzer.py
+│       └── schema_detection.py
 │
 ├── data/
+│   └── uploads/              # Original uploaded files (UUID filenames)
+│
+├── tests/
 │
 ├── api.py
 ├── streamlit_app.py
@@ -259,6 +265,98 @@ ecommerce_ai_analyst/
 ├── .env.example
 └── README.md
 ```
+
+---
+
+## Docker Compose Deployment
+
+### Prerequisites
+
+- Docker Desktop (Windows/macOS) or Docker Engine (Linux).
+- Docker Compose v2 (`docker compose`).
+
+The Compose setup builds one Python image and runs it as two services:
+`api` (FastAPI) and `streamlit` (the dashboard). The Streamlit container calls
+FastAPI at `http://api:8000` over the Compose network; `localhost` inside a
+container would refer to that same container, not the other service.
+
+### Configure and start
+
+Create a local `.env` file and set your Gemini key. The file is not copied into
+the image or committed:
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Linux / macOS:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and replace `your_new_key_here` with your own Gemini API key.
+Docker Compose passes it only to the API service. A key is required for
+Gemini-backed questions; upload, dashboard, forecasting, and inventory
+features can start without one.
+
+Build and launch both services:
+
+```bash
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+Compose waits for the FastAPI health check before starting Streamlit. Open:
+
+- Streamlit dashboard: <http://localhost:8501>
+- FastAPI root/health endpoint: <http://localhost:8000/>
+- FastAPI interactive docs: <http://localhost:8000/docs>
+
+The host ports can be changed with `STREAMLIT_PORT` and `API_PORT` in `.env`.
+The internal service ports stay at 8501 and 8000, and the dashboard's
+`API_BASE_URL` is fixed to the Compose service address `http://api:8000`.
+
+### Logs, rebuild, and stop
+
+```bash
+docker compose logs -f
+docker compose logs -f api
+docker compose logs -f streamlit
+docker compose up -d --build
+docker compose down
+```
+
+`docker compose down` stops and removes the containers and network but keeps
+the persistent data volume. To remove the database and uploaded files as well:
+
+```bash
+docker compose down -v
+```
+
+**Warning:** `down -v` permanently deletes the Compose-managed database and
+uploaded originals. Do not use it if you want to keep your data.
+
+### Persistent data and configuration
+
+Both services mount the same named volume, `ecommerce-analyst-data`, at
+`/data`. The SQLite database is `/data/ecommerce.db` and original uploads are
+stored in `/data/uploads`. Uploads from the dashboard are sent to FastAPI,
+which stores the file and atomically replaces the processed SQLite table. Since
+both containers use the same volume and paths, the dashboard sees the database
+created by the API rather than a separate SQLite copy.
+
+Compose overrides the local-development `DATA_DIR`, `DB_PATH`, `UPLOAD_DIR`,
+and `API_BASE_URL` values with container paths and service DNS. The Gemini
+credential is supplied as a runtime environment variable and is excluded from
+the Docker build context by `.dockerignore`.
+
+This project remains a single-active-dataset educational application. The
+FastAPI schema state is process-wide and both services share one database;
+Compose does not make concurrent users or uploads isolated.
 
 ---
 
@@ -324,15 +422,26 @@ GEMINI_API_KEY=your_new_key_here
 ```
 
 Optional configuration includes the Gemini model, request timeout, retry count,
-retry delay, and database path; the defaults are listed in `.env.example`.
+retry delay, database path, and upload directory; the defaults are listed in
+`.env.example`.
 
-### 5. Launch the Streamlit Dashboard
+### 5. Start the API and Streamlit dashboard
+
+Start FastAPI in the first terminal:
+
+```bash
+uvicorn api:app --reload
+```
+
+In a second terminal, start Streamlit:
 
 ```bash
 streamlit run streamlit_app.py
 ```
 
-The dashboard will normally be available at:
+The dashboard uses `API_BASE_URL` from `.env` (default
+`http://127.0.0.1:8000`) for upload, schema mapping, and AI requests. It will
+normally be available at:
 
 http://localhost:8501
 
@@ -340,13 +449,7 @@ Internet access is required for Gemini inference. No local LLM runtime is needed
 
 ---
 
-## Running the REST API
-
-Start FastAPI:
-
-```bash
-uvicorn api:app --reload
-```
+## REST API Reference
 
 API base URL:
 
@@ -362,6 +465,7 @@ http://127.0.0.1:8000/docs
 |---|---|---|
 | GET | `/` | API health message |
 | POST | `/upload-data` | Upload and process a dataset |
+| POST | `/schema-mapping` | Confirm semantic column mappings |
 | POST | `/ask-agent` | Ask a natural-language business question |
 | GET | `/forecast-readiness` | Check forecasting data requirements |
 | GET | `/forecast` | Generate demand forecasts |
@@ -408,6 +512,76 @@ Not every feature requires all these columns.
 
 The available KPIs and analytics depend on the actual dataset schema.
 
+### Dynamic Schema Detection
+
+The schema analyzer is not tied to one vendor's header names. It evaluates
+normalized aliases alongside bounded data profiles (data type, null rate,
+cardinality, numeric/date parse rates, ranges, and representative values).
+Profiles are sampled for classification while null counts and cardinality are
+computed across the full column. The Streamlit dashboard shows the detected
+semantic role, original uploaded header, confidence, evidence, and plausible
+alternatives. Use **Review detected fields** in the sidebar to confirm, replace,
+or leave a role unmapped. Applied mappings update downstream analysis and clear
+previous forecast and inventory results.
+
+Automatic mappings below a 0.65 score are not selected. Scores of at least 0.85
+are labeled high confidence; scores from 0.65 through 0.8499 are medium
+confidence. Similar candidate scores, duplicate headers, or one column matching
+multiple roles are reported as ambiguous instead of being silently assigned.
+These scores are evidence indicators, not statistical probabilities.
+
+The roles distinguish product identifiers from product names, sales quantity
+from current stock, unit price from revenue, and order IDs from product IDs.
+An absent stock field remains absent; historical quantity is never treated as
+on-hand inventory. Revenue is derived as `quantity * unit_price` only when no
+confident revenue column exists. Profit is derived as `revenue - cost` only
+when no confident profit column exists. The expressions and assumptions are
+included in the schema profile; discounts, taxes, and shipping are not
+automatically applied to derived revenue.
+
+Readiness is evaluated independently for forecasting, inventory, sales, and
+customer analysis. Forecast readiness additionally requires at least eight
+observed weekly periods for a product; missing weeks are not counted as
+observations by this assessment. Inventory readiness requires detected
+non-negative stock and a positive lead time (or a positive default explicitly
+provided by the caller). Sales readiness requires valid transaction dates and
+usable quantity or monetary values. Customer readiness requires customer IDs
+and usable transaction data.
+
+Example mapping excerpt:
+
+```json
+{
+  "field_mappings": {
+    "product_id": {
+      "column": "stock_code",
+      "original_column": "StockCode",
+      "confidence": "High confidence",
+      "detection_method": "exact semantic alias + data profile",
+      "ambiguous": false
+    },
+    "stock": {
+      "column": null,
+      "confidence": "Low confidence",
+      "reason": "No matching column with sufficient data evidence."
+    }
+  },
+  "readiness": {
+    "forecasting": {"ready": true},
+    "inventory": {
+      "ready": false,
+      "missing_fields": ["Inventory stock quantity"]
+    }
+  }
+}
+```
+
+For example, `StockCode`, `InvoiceDate`, `Quantity`, and `UnitPrice` can be
+recognized as product ID, transaction date, quantity sold, and unit price.
+`SKU`, `OrderDate`, `Qty`, and `Price` follow a different naming convention but
+map to the same roles. A separate `stock_quantity` or `available_stock` field is
+required for inventory recommendations.
+
 ### Recommended Data Quality
 
 For better results:
@@ -423,29 +597,56 @@ For better results:
 
 ## Forecasting Methodology
 
-The current forecasting implementation uses a simple eight-week moving average.
+`DemandForecaster` compares four candidate models separately for each product:
 
-For each product:
+- **8-week moving average:** baseline and fallback.
+- **Holt linear:** considered when the training window shows a clear trend
+  (at least 8 weeks, 1% relative slope, and absolute correlation of at least 0.6).
+- **Croston SBA:** considered only for intermittent demand: at least 40% zero
+  weeks, at least two positive weeks, and a mean interval of at least 1.5 weeks.
+- **Holt-Winters additive ETS:** considered only with at least two observed
+  52-week cycles in a training window.
 
-```text
-Forecasted Weekly Demand =
-Average Weekly Quantity Sold
-Over the Last 8 Weeks
+Selection uses up to three chronological expanding-window backtests. Each
+validation window spans the forecast horizon (4 weeks by default); each model
+is fitted using only the preceding weeks. MAE and WAPE are computed only over
+validation weeks with actual recorded observations. WAPE is `null` when actual
+demand sums to zero but prediction error is nonzero; if both are zero, WAPE is
+0. The selector ranks by WAPE, then MAE. If WAPE is undefined for all candidates,
+it ranks by MAE. Exact ties prefer the simpler models in this order: moving
+average, Holt, Croston SBA, then seasonal ETS.
+
+Missing calendar weeks default to zero demand for model training, preserving the
+original behavior. Set `DemandForecaster(missing_week_policy="interpolate")` to
+interpolate interior gaps and carry the last observed value across a trailing
+training gap. An imputed period is never treated as validation ground truth.
+Without an explicit data-coverage signal, an absent transaction week cannot be
+distinguished from a true zero-demand week; choose the policy that fits the
+dataset.
+
+Every product's `model_diagnostics` reports model eligibility, validation
+scores, selection reason, fallback use, and missing-week counts. When no full
+chronological validation horizon exists, the moving average is used and its
+validation metrics are `null`; this is not presented as a validated result.
+Forecasts are nonnegative estimates, not guarantees. They do not model
+promotions, stockouts, price changes, or external market factors.
+
+Example forecast record when no full backtest horizon is available:
+
+```json
+{
+  "product": "SKU-001",
+  "forecast_week": 1,
+  "forecast_date": "2025-01-06",
+  "forecast_quantity": 12.5,
+  "selected_model": "8_week_moving_average",
+  "validation_mae": null,
+  "validation_wape": null
+}
 ```
 
-The system generates estimates for the next four weeks.
-
-This baseline is designed to provide a transparent starting point.
-
-It does not currently model:
-- Annual seasonality.
-- Holiday effects.
-- Promotions.
-- Price changes.
-- External market factors.
-- Explicit stockout-adjusted demand.
-
-Forecasts should therefore be interpreted as estimates, not guaranteed future sales.
+Seasonal evaluation needs at least two years of observed weekly demand in a
+training window, so it will be unavailable for shorter datasets.
 
 ---
 
@@ -508,10 +709,24 @@ These should be considered before using recommendations for actual purchasing de
 - SQLite is opened in read-only mode for AI-generated queries.
 - A SQLite authorizer provides an additional query execution restriction.
 - Uploaded datasets are stored in the local SQLite database.
+- Original uploads are retained separately in `UPLOAD_DIR` (default
+  `data/uploads/`) with generated filenames. The cleaned dataset replaces the
+  `ecommerce_data` table in `DB_PATH` (default `data/ecommerce.db`).
+- A failed upload is removed and the prior SQLite table is retained. The table
+  swap is transactional.
 - Internet access and a valid Gemini API key are required for LLM features.
 - API quotas, rate limits, and possible usage costs are controlled by Google.
 
-The current implementation is intended for local development and demonstration. Additional authentication, authorization, upload limits, isolation, and security testing are required before public deployment.
+The FastAPI process keeps `current_schema` and the active database table in
+process-wide state. Streamlit sessions also share the configured SQLite file.
+Each successful upload replaces the one active dataset. This is a
+single-user educational design; simultaneous users or concurrent uploads can
+observe each other's dataset. A session-scoped/multi-tenant storage redesign is
+intentionally out of scope.
+
+The current implementation is intended for local development and demonstration.
+Additional authentication, authorization, upload limits, isolation, and
+security testing are required before public deployment.
 
 Do not upload confidential business data to an unsecured deployment.
 
@@ -521,13 +736,12 @@ Do not upload confidential business data to an unsecured deployment.
 
 The current version is a working baseline, with the following limitations:
 
-1. Forecasting uses a moving-average approach rather than an advanced time-series model.
-2. Forecast quality depends on historical data quality and completeness.
-3. Missing weekly periods are currently treated as zero demand.
-4. Inventory calculations assume the selected stock value represents the current product stock.
-5. Supplier lead time may be entered as a shared default.
-6. The application currently processes one active dataset at a time.
-7. AI-generated SQL and insights require validation before use in critical business decisions.
+1. Forecast model selection depends on data history, coverage, and the chosen missing-week policy.
+2. Seasonal ETS requires at least two years of observed weekly history for training.
+3. Inventory calculations use the latest dated stock/lead-time record and skip products with invalid latest values.
+4. Supplier lead time may be entered as a shared default.
+5. The application currently processes one active dataset at a time and is not safe for concurrent users.
+6. AI-generated SQL and insights require validation before use in critical business decisions.
 
 ---
 

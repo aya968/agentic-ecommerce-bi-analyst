@@ -1,4 +1,4 @@
-from typing import TypedDict, Optional, Any
+from typing import Optional, TypedDict
 
 
 class AgentState(TypedDict, total=False):
@@ -10,6 +10,9 @@ class AgentState(TypedDict, total=False):
     columns: list
     insight: str
     error: Optional[str]
+    previous_sql: Optional[str]
+    sql_error: Optional[str]
     retry_count: int
     success: bool
+    sql_ready: bool
     

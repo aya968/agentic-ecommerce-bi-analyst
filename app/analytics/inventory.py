@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 
 
@@ -77,6 +79,14 @@ class InventoryOptimizer:
         default_lead_time_days=None,
         service_level_z=1.65
     ):
+        if not forecast_result.get("ready"):
+            return self.optimize(
+                forecast_result,
+                schema,
+                service_level_z,
+                default_lead_time_days
+            )
+
         readiness = self.optimize(
             forecast_result,
             schema,
@@ -103,13 +113,27 @@ class InventoryOptimizer:
                 "ready": False,
                 "message": "Required product, date, quantity or stock column is missing."
             }
+        required_columns = [
+            product_col,
+            date_col,
+            quantity_col,
+            stock_col
+        ]
+        if lead_time_col:
+            required_columns.append(lead_time_col)
+        if any(column not in df.columns for column in required_columns):
+            return {
+                "ready": False,
+                "message": "One or more inventory columns are unavailable."
+            }
 
         data = df.copy()
 
         data[date_col] = pd.to_datetime(
             data[date_col],
-            errors="coerce"
-        )
+            errors="coerce",
+            utc=True
+        ).dt.tz_convert(None)
 
         data[quantity_col] = pd.to_numeric(
             data[quantity_col],
@@ -127,14 +151,25 @@ class InventoryOptimizer:
                 errors="coerce"
             )
 
-        data = data.dropna(
-            subset=[
-                product_col,
-                date_col,
-                quantity_col,
-                stock_col
-            ]
+        product_is_valid = data[product_col].map(
+            lambda value: pd.notna(value) and bool(str(value).strip())
         )
+
+        undated_products = set(
+            data.loc[
+                data[date_col].isna() & product_is_valid,
+                product_col
+            ].astype(str)
+        )
+
+        finite_quantity = data[quantity_col].map(
+            lambda value: pd.notna(value) and math.isfinite(float(value))
+        )
+        data = data.loc[
+            product_is_valid
+            & data[date_col].notna()
+            & finite_quantity
+        ].copy()
 
         if data.empty:
             return {
@@ -154,34 +189,92 @@ class InventoryOptimizer:
                 "message": "No usable product forecasts are available."
             }
 
+        forecast_df["forecast_quantity"] = pd.to_numeric(
+            forecast_df["forecast_quantity"],
+            errors="coerce"
+        )
+        forecast_df = forecast_df.loc[
+            forecast_df["forecast_quantity"].map(
+                lambda value: (
+                    pd.notna(value)
+                    and math.isfinite(float(value))
+                    and float(value) >= 0
+                )
+            )
+        ]
         forecast_by_product = (
             forecast_df[
-                forecast_df["forecast_quantity"].notna()
+                forecast_df["product"].notna()
             ]
             .groupby("product")["forecast_quantity"]
             .mean()
             .to_dict()
         )
 
+        skipped_products = []
         for product, group in data.groupby(product_col):
             product_key = str(product)
 
             if product_key not in forecast_by_product:
                 continue
 
-            current_stock = float(group[stock_col].iloc[-1])
+            if product_key in undated_products:
+                skipped_products.append({
+                    "product": product_key,
+                    "reason": (
+                        "A record has an invalid date, so the latest "
+                        "inventory values cannot be determined safely."
+                    )
+                })
+                continue
+
+            group = group.sort_values(date_col, kind="stable")
+            latest = group.iloc[-1]
+            stock_value = latest[stock_col]
+
+            if (
+                pd.isna(stock_value)
+                or not math.isfinite(float(stock_value))
+                or float(stock_value) < 0
+            ):
+                skipped_products.append({
+                    "product": product_key,
+                    "reason": (
+                        "The latest dated record has missing or invalid "
+                        "stock; no recommendation was generated."
+                    )
+                })
+                continue
+
+            current_stock = float(stock_value)
 
             if lead_time_col:
-                lead_values = group[lead_time_col].dropna()
-
-                if lead_values.empty:
+                lead_value = latest[lead_time_col]
+                if (
+                    pd.isna(lead_value)
+                    or not math.isfinite(float(lead_value))
+                    or float(lead_value) <= 0
+                ):
+                    skipped_products.append({
+                        "product": product_key,
+                        "reason": (
+                            "The latest dated record has missing or "
+                            "invalid lead time; no recommendation was generated."
+                        )
+                    })
                     continue
-
-                lead_time = float(lead_values.iloc[-1])
+                lead_time = float(lead_value)
             else:
                 lead_time = float(default_lead_time_days)
 
-            if lead_time < 0:
+            if not math.isfinite(lead_time) or lead_time <= 0:
+                skipped_products.append({
+                    "product": product_key,
+                    "reason": (
+                        "Lead time must be a finite positive number; "
+                        "no recommendation was generated."
+                    )
+                })
                 continue
 
             daily_forecast = (
@@ -245,6 +338,7 @@ class InventoryOptimizer:
         return {
             "ready": True,
             "recommendations": output,
+            "skipped_products": skipped_products,
             "assumptions": {
                 "service_level_z": service_level_z,
                 "target_coverage": "Lead time + 7 days",

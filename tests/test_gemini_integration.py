@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -125,14 +126,16 @@ class LangGraphIntegrationTests(unittest.TestCase):
     def test_full_workflow_uses_both_llm_nodes_and_read_only_sql(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "ecommerce.db"
-            with sqlite3.connect(db_path) as connection:
-                connection.execute(
-                    "CREATE TABLE ecommerce_data (product TEXT, revenue REAL)"
-                )
-                connection.execute(
-                    "INSERT INTO ecommerce_data VALUES (?, ?)",
-                    ("Widget", 42.5)
-                )
+            with closing(sqlite3.connect(db_path)) as connection:
+                with connection:
+                    connection.execute(
+                        "CREATE TABLE ecommerce_data "
+                        "(product TEXT, revenue REAL)"
+                    )
+                    connection.execute(
+                        "INSERT INTO ecommerce_data VALUES (?, ?)",
+                        ("Widget", 42.5)
+                    )
 
             original_execute = SQLValidator.execute_read_only
             with patch(
@@ -164,7 +167,7 @@ class LangGraphIntegrationTests(unittest.TestCase):
                     "DELETE FROM ecommerce_data",
                     str(db_path)
                 )
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 self.assertEqual(
                     connection.execute(
                         "SELECT COUNT(*) FROM ecommerce_data"

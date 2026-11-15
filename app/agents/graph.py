@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import time
 
 import httpx
@@ -22,6 +23,10 @@ from app.agents.prompts import (
 )
 
 from app.agents.sql_validator import SQLValidator
+
+
+MAX_SQL_RETRIES = 2
+MAX_SQL_ERROR_CONTEXT_LENGTH = 500
 
 
 def query_llm(prompt, system_prompt="", temperature=0.1):
@@ -112,6 +117,23 @@ def query_llm(prompt, system_prompt="", temperature=0.1):
 
 def generate_sql_node(state: AgentState):
     schema = state.get("schema_description", "")
+    correction_context = ""
+    previous_sql = state.get("previous_sql")
+    sql_error = state.get("sql_error")
+
+    if previous_sql or sql_error:
+        correction_context = f"""
+Previous SQL that failed:
+{previous_sql or "(no previous SQL was generated)"}
+
+SQL execution error:
+{sql_error or "(no execution error was recorded)"}
+
+Correct this specific problem. Preserve the user's original intent and
+return a corrected SQLite SELECT query, not an unrelated replacement.
+This is correction attempt {state.get("retry_count", 0)} of
+{MAX_SQL_RETRIES}.
+"""
 
     prompt = f"""
 Database schema:
@@ -120,6 +142,8 @@ Database schema:
 
 User question:
 {state.get("question", "")}
+
+{correction_context}
 
 Generate one SQLite SELECT query.
 Return SQL only.
@@ -137,19 +161,39 @@ Return SQL only.
                     "The available dataset does not contain "
                     "the columns needed to answer this question."
                 ),
-                "success": False
+                "success": False,
+                "sql_ready": False,
+                "generated_sql": None
             }
 
         return {
             "generated_sql": generated_sql,
-            "error": None
+            "error": None,
+            "sql_error": None,
+            "previous_sql": None,
+            "sql_ready": True
         }
 
-    except Exception as error:
+    except Exception:
         return {
-            "error": str(error),
+            "error": (
+                "SQL generation failed. Check Gemini configuration "
+                "and try again."
+            ),
+            "generated_sql": None,
+            "sql_ready": False,
             "success": False
         }
+
+
+def route_after_generation(state: AgentState):
+    return "execute_sql" if state.get("sql_ready") else END
+
+
+def _sql_error_context(error):
+    if isinstance(error, (ValueError, sqlite3.Error)):
+        return str(error)[:MAX_SQL_ERROR_CONTEXT_LENGTH]
+    return f"SQL execution failed ({type(error).__name__})."
 
 
 def execute_sql_node(state: AgentState):
@@ -166,12 +210,19 @@ def execute_sql_node(state: AgentState):
                 "truncated": result["truncated"]
             },
             "error": None,
+            "sql_error": None,
+            "previous_sql": None,
             "success": True
         }
 
     except Exception as error:
         return {
-            "error": str(error),
+            "error": (
+                "Generated SQL could not be executed. "
+                "Attempting a correction."
+            ),
+            "previous_sql": state.get("generated_sql"),
+            "sql_error": _sql_error_context(error),
             "success": False,
             "retry_count": state.get("retry_count", 0) + 1
         }
@@ -206,12 +257,9 @@ Explain the result as an E-commerce business analyst.
             "success": True
         }
 
-    except Exception as error:
+    except Exception:
         return {
-            "insight": (
-                "SQL query executed successfully, but insight "
-                f"generation failed: {error}"
-            ),
+            "insight": "SQL query executed successfully, but insight generation failed.",
             "success": True
         }
 
@@ -220,7 +268,7 @@ def route_after_execution(state: AgentState):
     if state.get("success"):
         return "insight"
 
-    if state.get("retry_count", 0) <= 2:
+    if state.get("retry_count", 0) <= MAX_SQL_RETRIES:
         return "generate_sql"
 
     return END
@@ -235,7 +283,14 @@ def build_agent():
 
     workflow.set_entry_point("generate_sql")
 
-    workflow.add_edge("generate_sql", "execute_sql")
+    workflow.add_conditional_edges(
+        "generate_sql",
+        route_after_generation,
+        {
+            "execute_sql": "execute_sql",
+            END: END
+        }
+    )
 
     workflow.add_conditional_edges(
         "execute_sql",
@@ -269,10 +324,23 @@ def ask_agent(question, schema_profile):
         "schema_description": schema_description,
         "retry_count": 0,
         "success": False,
-        "error": None
+        "error": None,
+        "previous_sql": None,
+        "sql_error": None,
+        "sql_ready": False
     }
 
     result = agent.invoke(initial_state)
+    error = result.get("error")
+    if (
+        not result.get("success")
+        and result.get("retry_count", 0) > MAX_SQL_RETRIES
+    ):
+        error = (
+            "Unable to execute the generated SQL after "
+            f"{MAX_SQL_RETRIES} correction attempts. "
+            "Revise the question and try again."
+        )
 
     return {
         "question": question,
@@ -280,7 +348,7 @@ def ask_agent(question, schema_profile):
         "data": result.get("sql_result", []),
         "columns": result.get("columns", []),
         "insight": result.get("insight"),
-        "error": result.get("error"),
+        "error": error,
         "success": result.get("success", False)
     }
     
