@@ -38,6 +38,12 @@ API_BASE_URL = os.getenv(
 API_TIMEOUT_SECONDS = float(
     os.getenv("API_TIMEOUT_SECONDS", "300")
 )
+SESSION_TTL_SECONDS = int(
+    os.getenv("SESSION_TTL_SECONDS", "86400")
+)
+MAX_UPLOAD_BYTES = int(
+    os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024))
+)
 
 MAX_ROWS_PREVIEW = 10
 MAX_SQL_ROWS = 500

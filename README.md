@@ -343,20 +343,21 @@ uploaded originals. Do not use it if you want to keep your data.
 ### Persistent data and configuration
 
 Both services mount the same named volume, `ecommerce-analyst-data`, at
-`/data`. The SQLite database is `/data/ecommerce.db` and original uploads are
-stored in `/data/uploads`. Uploads from the dashboard are sent to FastAPI,
-which stores the file and atomically replaces the processed SQLite table. Since
-both containers use the same volume and paths, the dashboard sees the database
-created by the API rather than a separate SQLite copy.
+`/data`. Session databases and original uploads are stored at
+`/data/sessions/<session_id>/ecommerce.db` and
+`/data/sessions/<session_id>/uploads/`. The dashboard sends uploads to FastAPI,
+which writes into that session's directory. The shared mount preserves these
+files across container restarts; each session still has its own SQLite file.
 
 Compose overrides the local-development `DATA_DIR`, `DB_PATH`, `UPLOAD_DIR`,
 and `API_BASE_URL` values with container paths and service DNS. The Gemini
 credential is supplied as a runtime environment variable and is excluded from
 the Docker build context by `.dockerignore`.
 
-This project remains a single-active-dataset educational application. The
-FastAPI schema state is process-wide and both services share one database;
-Compose does not make concurrent users or uploads isolated.
+The app has no user account system; the unguessable server-issued session ID
+acts as a bearer capability. Keep it private. Session isolation is intended for
+this educational application and is not a substitute for authentication,
+authorization, encryption, or hardened public deployment.
 
 ---
 
@@ -464,12 +465,20 @@ http://127.0.0.1:8000/docs
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/` | API health message |
-| POST | `/upload-data` | Upload and process a dataset |
+| POST | `/sessions` | Create an isolated dataset session |
+| POST | `/sessions/activity` | Extend the current session TTL |
+| DELETE | `/sessions/{session_id}` | Delete the matching owned session |
+| POST | `/upload-data` | Upload or explicitly replace a session dataset |
+| GET | `/dataset` | Read the current session's cleaned data |
 | POST | `/schema-mapping` | Confirm semantic column mappings |
 | POST | `/ask-agent` | Ask a natural-language business question |
-| GET | `/forecast-readiness` | Check forecasting data requirements |
-| GET | `/forecast` | Generate demand forecasts |
-| POST | `/inventory` | Generate inventory recommendations |
+| GET | `/forecast-readiness` | Check current session forecasting data |
+| GET | `/forecast` | Generate current session forecasts |
+| POST | `/inventory` | Generate current session recommendations |
+
+All session-specific endpoints require the `X-Session-ID` header. Create the
+session first and treat its UUID as a secret bearer token. Requests without a
+valid active session cannot select an arbitrary database path.
 
 ### Example: Ask the AI Agent
 
@@ -709,24 +718,32 @@ These should be considered before using recommendations for actual purchasing de
 - SQLite is opened in read-only mode for AI-generated queries.
 - A SQLite authorizer provides an additional query execution restriction.
 - Uploaded datasets are stored in the local SQLite database.
-- Original uploads are retained separately in `UPLOAD_DIR` (default
-  `data/uploads/`) with generated filenames. The cleaned dataset replaces the
-  `ecommerce_data` table in `DB_PATH` (default `data/ecommerce.db`).
-- A failed upload is removed and the prior SQLite table is retained. The table
-  swap is transactional.
+- Each browser session receives a server-generated UUID. Its files live under
+  `DATA_DIR/sessions/<session_id>/`, with its own `ecommerce.db`, `uploads/`
+  directory, and `session.json` timestamps/schema metadata. The UUID is required
+  on API requests and is validated before a session path is opened.
+- Uploads are CSV, `.xlsx`, or legacy `.xls`, are limited by
+  `MAX_UPLOAD_BYTES` (50 MiB by default), and use generated filenames rather
+  than user-supplied paths. Replacing a session's current dataset requires
+  explicit confirmation. A staged database replaces the current file only
+  after validation; an unsuccessful replacement preserves the previous data.
+- Session activity extends the configurable `SESSION_TTL_SECONDS` (24 hours by
+  default). Expired directories are removed at API startup, and users can
+  explicitly delete their current session. SQLite connections are closed before
+  cleanup/deletion.
 - Internet access and a valid Gemini API key are required for LLM features.
 - API quotas, rate limits, and possible usage costs are controlled by Google.
 
-The FastAPI process keeps `current_schema` and the active database table in
-process-wide state. Streamlit sessions also share the configured SQLite file.
-Each successful upload replaces the one active dataset. This is a
-single-user educational design; simultaneous users or concurrent uploads can
-observe each other's dataset. A session-scoped/multi-tenant storage redesign is
-intentionally out of scope.
+FastAPI loads schema metadata from the owning session rather than a global
+`current_schema`. SQL execution receives that session's explicit SQLite path.
+Forecasting and inventory load the same session database. The Streamlit UI
+retains a copy of the active session's cleaned dataframe for its local charts.
+The API uses per-session request locks so a replacement or manual deletion does
+not race an active SQL, forecasting, or inventory request.
 
-The current implementation is intended for local development and demonstration.
-Additional authentication, authorization, upload limits, isolation, and
-security testing are required before public deployment.
+The session ID is a bearer capability, not a login. The project is intended for
+local development and portfolio demonstrations; add real authentication and
+authorization before exposing it publicly.
 
 Do not upload confidential business data to an unsecured deployment.
 
@@ -740,8 +757,9 @@ The current version is a working baseline, with the following limitations:
 2. Seasonal ETS requires at least two years of observed weekly history for training.
 3. Inventory calculations use the latest dated stock/lead-time record and skip products with invalid latest values.
 4. Supplier lead time may be entered as a shared default.
-5. The application currently processes one active dataset at a time and is not safe for concurrent users.
-6. AI-generated SQL and insights require validation before use in critical business decisions.
+5. Session folders are cleaned at API startup, not by a background scheduler. Sessions untouched for the configured TTL are removed on the next API start.
+6. Session IDs provide isolation but are not an authentication system; anyone who obtains an ID can act as that session.
+7. AI-generated SQL and insights require validation before use in critical business decisions.
 
 ---
 

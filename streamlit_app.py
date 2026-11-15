@@ -2,7 +2,6 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from app.database.db_manager import DatabaseManager
 from app.analytics.forecasting import DemandForecaster
 from app.analytics.inventory import InventoryOptimizer
 from app.config import API_BASE_URL, API_TIMEOUT_SECONDS
@@ -195,7 +194,6 @@ footer {
 # INITIALIZE APPLICATION
 # =========================================================
 
-db_manager = DatabaseManager()
 forecaster = DemandForecaster()
 inventory_optimizer = InventoryOptimizer()
 
@@ -204,7 +202,7 @@ inventory_optimizer = InventoryOptimizer()
 # SESSION STATE
 # =========================================================
 
-def initialize_session():
+def initialize_ui_state():
 
     defaults = {
         "uploaded": False,
@@ -213,16 +211,15 @@ def initialize_session():
         "dataframe": None,
         "forecast_result": None,
         "dataset_name": None,
-        "inventory_result": None
+        "inventory_result": None,
+        "session_id": None,
+        "session_error": None
     }
 
     for key, value in defaults.items():
 
         if key not in st.session_state:
             st.session_state[key] = value
-
-
-initialize_session()
 
 
 def clear_dataset_session():
@@ -234,7 +231,10 @@ def clear_dataset_session():
         "forecast_result",
         "dataset_name",
         "inventory_result",
-        "dataset_uploader"
+        "dataset_uploader",
+        "confirm_session_deletion",
+        "confirm_dataset_replacement",
+        "session_id"
     ):
         st.session_state.pop(key, None)
 
@@ -263,11 +263,19 @@ def format_number(value):
 
 
 def call_api(method, path, **kwargs):
+    session_id = kwargs.pop(
+        "session_id",
+        st.session_state.get("session_id")
+    )
+    headers = dict(kwargs.pop("headers", {}))
+    if session_id:
+        headers["X-Session-ID"] = session_id
     try:
         response = httpx.request(
             method,
             f"{API_BASE_URL}{path}",
             timeout=API_TIMEOUT_SECONDS,
+            headers=headers,
             **kwargs
         )
     except httpx.TimeoutException as error:
@@ -300,6 +308,50 @@ def call_api(method, path, **kwargs):
         raise RuntimeError(
             "The backend API returned an invalid response."
         ) from error
+
+
+def initialize_session():
+    initialize_ui_state()
+
+    if st.session_state.get("session_id"):
+        try:
+            call_api("POST", "/sessions/activity")
+            return
+        except RuntimeError as error:
+            st.session_state.session_error = str(error)
+            st.session_state.session_id = None
+            for key in (
+                "uploaded",
+                "schema",
+                "cleaning_report",
+                "dataframe",
+                "forecast_result",
+                "dataset_name",
+                "inventory_result"
+            ):
+                st.session_state[key] = None if key != "uploaded" else False
+
+    try:
+        created = call_api(
+            "POST",
+            "/sessions",
+            session_id=None
+        )
+        st.session_state.session_id = created["session_id"]
+        call_api("POST", "/sessions/activity")
+        st.session_state.session_error = None
+    except (RuntimeError, KeyError) as error:
+        st.session_state.session_error = str(error)
+
+
+initialize_session()
+
+if st.session_state.session_error or not st.session_state.session_id:
+    st.error(
+        st.session_state.session_error
+        or "Could not create a dataset session. Check the backend API."
+    )
+    st.stop()
 
 
 def schema_mapping_rows(schema):
@@ -454,10 +506,22 @@ with st.sidebar:
             f"Selected file: {uploaded_file.name}"
         )
 
+        replace_confirmed = True
+        if st.session_state.uploaded:
+            replace_confirmed = st.checkbox(
+                "I confirm replacing this session's current dataset",
+                key="confirm_dataset_replacement"
+            )
+
         if st.button(
-            "Process Dataset",
+            (
+                "Replace Current Dataset"
+                if st.session_state.uploaded
+                else "Process Dataset"
+            ),
             type="primary",
-            use_container_width=True
+            use_container_width=True,
+            disabled=not replace_confirmed
         ):
             try:
                 with st.spinner(
@@ -473,9 +537,15 @@ with st.sidebar:
                                 uploaded_file.type
                                 or "application/octet-stream"
                             )
+                        },
+                        data={
+                            "replace_existing": str(
+                                st.session_state.uploaded
+                            ).lower()
                         }
                     )
-                    dataframe = db_manager.get_dataframe()
+                    dataset_result = call_api("GET", "/dataset")
+                    dataframe = pd.DataFrame(dataset_result["rows"])
                     schema = result["schema_profile"]
                     schema["all_columns"] = result.get(
                         "columns",
@@ -490,6 +560,7 @@ with st.sidebar:
                     st.session_state.dataset_name = uploaded_file.name
                     st.session_state.forecast_result = None
                     st.session_state.inventory_result = None
+                    st.session_state.confirm_dataset_replacement = False
 
                 st.success(
                     "Dataset processed successfully!"
@@ -511,11 +582,24 @@ with st.sidebar:
             st.session_state.dataset_name
         )
 
-        st.button(
-            "Clear Session",
-            use_container_width=True,
-            on_click=clear_dataset_session
+        confirm_delete = st.checkbox(
+            "I understand this permanently deletes this session's files",
+            key="confirm_session_deletion"
         )
+        if st.button(
+            "Delete Session",
+            use_container_width=True,
+            disabled=not confirm_delete
+        ):
+            try:
+                call_api(
+                    "DELETE",
+                    f"/sessions/{st.session_state.session_id}"
+                )
+                clear_dataset_session()
+                st.rerun()
+            except RuntimeError as error:
+                st.error(str(error))
 
         with st.expander("Review detected fields"):
             active_df = st.session_state.dataframe

@@ -198,9 +198,16 @@ def _sql_error_context(error):
 
 def execute_sql_node(state: AgentState):
     try:
-        result = SQLValidator.execute_read_only(
-            state["generated_sql"]
-        )
+        database_path = state.get("db_path")
+        if database_path is None:
+            result = SQLValidator.execute_read_only(
+                state["generated_sql"]
+            )
+        else:
+            result = SQLValidator.execute_read_only(
+                state["generated_sql"],
+                db_path=database_path
+            )
 
         return {
             "sql_result": result["rows"],
@@ -311,7 +318,7 @@ def build_agent():
 agent = build_agent()
 
 
-def ask_agent(question, schema_profile):
+def ask_agent(question, schema_profile, db_path=None):
     schema_description = json.dumps(
         schema_profile,
         ensure_ascii=False,
@@ -329,6 +336,8 @@ def ask_agent(question, schema_profile):
         "sql_error": None,
         "sql_ready": False
     }
+    if db_path is not None:
+        initial_state["db_path"] = str(db_path)
 
     result = agent.invoke(initial_state)
     error = result.get("error")

@@ -15,4 +15,5 @@ class AgentState(TypedDict, total=False):
     retry_count: int
     success: bool
     sql_ready: bool
+    db_path: Optional[str]
     
